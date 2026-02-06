@@ -193,3 +193,12 @@ if res:
             f"<div>終了日：{res['end']:%Y/%m/%d}</div>"
             f"<div>通貨：{res['ccy']}</div>"
             f"<div style='margin-top:6mm;font-size:20pt;font-weight:700;'>平均TTS：{res['avg']:,.2f} 円</div>"
+            f"<div style='margin-top:6mm;font-size:10pt;'>{res['note']}</div>"
+            '</div></div>'
+        ),
+        unsafe_allow_html=True
+    )
+
+if st.session_state.get("do_print"):
+    components.html("<script>parent.window.print()</script>", height=0, scrolling=False)
+    st.session_state["do_print"] = False
