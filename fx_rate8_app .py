@@ -1,7 +1,6 @@
-# fx_rate8_app.py（Streamlit Cloud対応：社内プロキシを自動で使い分け）
 import io
-from datetime import date, timedelta
 import os
+from datetime import date, timedelta
 import requests
 import pandas as pd
 import streamlit as st
@@ -9,10 +8,17 @@ import streamlit.components.v1 as components
 
 MIZUHO_CSV_URL = "https://www.mizuhobank.co.jp/market/quote.csv"
 
+# 対象通貨（IDR除外版のまま：必要なら追加可）
 TARGET_CCYS = ["USD", "EUR", "GBP", "AUD", "SGD", "THB"]
 
+# スプレッド（円）
+# THB 8円は 100THBあたり → /100 補正
 SPREAD_BY_CCY_JPY = {
-    "USD": 1.00, "EUR": 1.40, "GBP": 4.00, "AUD": 2.50, "SGD": 0.83,
+    "USD": 1.00,
+    "EUR": 1.40,
+    "GBP": 4.00,
+    "AUD": 2.50,
+    "SGD": 0.83,
     "THB": 8.00,  # 100THBあたり
 }
 HUNDRED_UNIT_SPREAD = {"THB"}
@@ -21,22 +27,29 @@ def get_spread_per_unit(ccy: str) -> float:
     s = float(SPREAD_BY_CCY_JPY.get(ccy.upper(), 0.0))
     return s / 100.0 if ccy.upper() in HUNDRED_UNIT_SPREAD else s
 
-# --- ここが重要：プロキシ設定を「存在するときだけ」使う ---
+# --------- 重要：Cloudでは社内プロキシを使わない（存在しないため）
+# 社内PCで必要な場合だけ、環境変数（またはCloudのSecrets）から読み込む
 def get_requests_kwargs():
     """
-    社内PC：環境変数（またはst.secrets）にプロキシが入っていればそれを使う
-    Streamlit Cloud：プロキシが無いので None → 直アクセス
+    1) Streamlit Cloud: PROXYが無い→直アクセス（これが正しい）
+    2) 社内PC: PROXY_HTTP / PROXY_HTTPS を環境変数に設定すればプロキシ利用
     """
-    # 1) secrets（CloudのUIで設定できる）優先
-    proxy_http = st.secrets.get("PROXY_HTTP", None) if hasattr(st, "secrets") else None
-    proxy_https = st.secrets.get("PROXY_HTTPS", None) if hasattr(st, "secrets") else None
-    verify = st.secrets.get("REQUESTS_VERIFY", True) if hasattr(st, "secrets") else True
+    # CloudのSecrets（必要なら）→ st.secrets から
+    proxy_http = None
+    proxy_https = None
+    verify = True
 
-    # 2) 無ければ環境変数
+    if hasattr(st, "secrets"):
+        proxy_http = st.secrets.get("PROXY_HTTP", None)
+        proxy_https = st.secrets.get("PROXY_HTTPS", None)
+        verify = st.secrets.get("REQUESTS_VERIFY", True)
+
+    # 環境変数（ローカルPC向け）
     if proxy_http is None:
         proxy_http = os.environ.get("PROXY_HTTP")
     if proxy_https is None:
         proxy_https = os.environ.get("PROXY_HTTPS")
+
     if "REQUESTS_VERIFY" in os.environ:
         v = os.environ.get("REQUESTS_VERIFY", "true").lower()
         verify = (v == "true")
@@ -49,11 +62,18 @@ def get_requests_kwargs():
         if proxy_https:
             proxies["https"] = proxy_https
 
-    # requests.get に渡す kwargs
     kwargs = {"timeout": 25, "verify": verify}
     if proxies:
         kwargs["proxies"] = proxies
     return kwargs
+
+def adjust_to_next_business_day(available_dates: set[date], end_date: date) -> date:
+    d = end_date
+    for _ in range(7):
+        if d in available_dates:
+            return d
+        d += timedelta(days=1)
+    return end_date
 
 def load_quote_csv_minimal() -> pd.DataFrame:
     kwargs = get_requests_kwargs()
@@ -61,6 +81,7 @@ def load_quote_csv_minimal() -> pd.DataFrame:
     r.raise_for_status()
     text = r.content.decode("shift_jis", errors="ignore")
 
+    # シンプル読込（fx_rate6系の方針）
     try:
         df = pd.read_csv(io.StringIO(text), encoding="shift_jis")
     except Exception:
@@ -74,14 +95,6 @@ def load_quote_csv_minimal() -> pd.DataFrame:
     df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
     df = df.dropna(subset=["DATE"]).reset_index(drop=True)
     return df
-
-def adjust_to_next_business_day(available_dates: set[date], end_date: date) -> date:
-    d = end_date
-    for _ in range(7):
-        if d in available_dates:
-            return d
-        d += timedelta(days=1)
-    return end_date
 
 def get_avg_ttm_simple(df: pd.DataFrame, ccy: str, start_d: date, end_d: date) -> float:
     if ccy not in df.columns:
@@ -98,7 +111,7 @@ def get_avg_ttm_simple(df: pd.DataFrame, ccy: str, start_d: date, end_d: date) -
         raise ValueError(f"{start_d}〜{end_d} に {ccy} のTTMが見つかりません。")
     return float(sel.mean())
 
-# ===== 印刷CSS（印刷は印刷ブロックのみ／白地黒文字／A4上半分）=====
+# ====== 印刷CSS（印刷は印刷ブロックのみ／白地黒文字／A4上半分） ======
 PRINT_CSS = r"""
 <style>
   .print-sheet { display: none; }
@@ -113,13 +126,15 @@ PRINT_CSS = r"""
       width:calc(100% - 32mm); height:140mm; overflow:hidden;
       page-break-after:avoid; page-break-inside:avoid;
     }
+    header, footer { display:none !important; }
   }
 </style>
 """
 st.markdown(PRINT_CSS, unsafe_allow_html=True)
 
-# ===== UI =====
+# ====== UI ======
 st.title("出張期間の平均レート")
+
 today = date.today()
 default_start = today - timedelta(days=30)
 c1, c2 = st.columns(2)
@@ -128,7 +143,14 @@ with c1:
 with c2:
     end_date = st.date_input("終了日（帰着日）", today)
 
+st.caption("プルダウンに出ない通貨の場合には、メールで経理U及川宛てにレートの問い合わせをしてください")
+
 foreign = st.selectbox("外貨（対JPY）", TARGET_CCYS, index=0)
+
+if "result" not in st.session_state:
+    st.session_state["result"] = None
+if "do_print" not in st.session_state:
+    st.session_state["do_print"] = False
 
 if st.button("平均レート計算"):
     try:
@@ -145,7 +167,13 @@ if st.button("平均レート計算"):
         spread = get_spread_per_unit(foreign)
         avg_tts = round(avg_ttm + spread, 2)
 
-        st.session_state["result"] = {"start": start_date, "end": adjusted_end, "ccy": foreign, "avg": avg_tts, "note": adjust_note}
+        st.session_state["result"] = {
+            "start": start_date,
+            "end": adjusted_end,
+            "ccy": foreign,
+            "avg": avg_tts,
+            "note": adjust_note
+        }
     except Exception as e:
         st.error(str(e))
 
@@ -157,21 +185,11 @@ if res:
         st.session_state["do_print"] = True
 
     st.markdown(
-        f"""
-        <div class="print-sheet">
-          <div>
-            <h2 style="margin:0 0 8mm 0;">出張期間の平均レート</h2>
-            <div>開始日：{res['start']:%Y/%m/%d}</div>
-            <div>終了日：{res['end']:%Y/%m/%d}</div>
-            <div>通貨：{res['ccy']}</div>
-            <div style="margin-top:6mm;font-size:20pt;font-weight:700;">平均TTS：{res['avg']:,.2f} 円</div>
-            <div style="margin-top:6mm;font-size:10pt;">{res['note']}</div>
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
-if st.session_state.get("do_print"):
-    components.html("<script>parent.window.print()</script>", height=0, scrolling=False)
-    st.session_state["do_print"] = False
+        (
+            '<div class="print-sheet">'
+            '<div>'
+            '<h2 style="margin:0 0 8mm 0;">出張期間の平均レート</h2>'
+            f"<div>開始日：{res['start']:%Y/%m/%d}</div>"
+            f"<div>終了日：{res['end']:%Y/%m/%d}</div>"
+            f"<div>通貨：{res['ccy']}</div>"
+            f"<div style='margin-top:6mm;font-size:20pt;font-weight:700;'>平均TTS：{res['avg']:,.2f} 円</div>"
