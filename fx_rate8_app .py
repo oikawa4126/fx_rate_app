@@ -1,5 +1,4 @@
 import io
-import os
 from datetime import date, timedelta
 import requests
 import pandas as pd
@@ -8,11 +7,10 @@ import streamlit.components.v1 as components
 
 MIZUHO_CSV_URL = "https://www.mizuhobank.co.jp/market/quote.csv"
 
-# 対象通貨（IDR除外版のまま：必要なら追加可）
+# 通貨
 TARGET_CCYS = ["USD", "EUR", "GBP", "AUD", "SGD", "THB"]
 
-# スプレッド（円）
-# THB 8円は 100THBあたり → /100 補正
+# スプレッド（円） THBは100THBあたり8円 → /100
 SPREAD_BY_CCY_JPY = {
     "USD": 1.00,
     "EUR": 1.40,
@@ -27,46 +25,6 @@ def get_spread_per_unit(ccy: str) -> float:
     s = float(SPREAD_BY_CCY_JPY.get(ccy.upper(), 0.0))
     return s / 100.0 if ccy.upper() in HUNDRED_UNIT_SPREAD else s
 
-# --------- 重要：Cloudでは社内プロキシを使わない（存在しないため）
-# 社内PCで必要な場合だけ、環境変数（またはCloudのSecrets）から読み込む
-def get_requests_kwargs():
-    """
-    1) Streamlit Cloud: PROXYが無い→直アクセス（これが正しい）
-    2) 社内PC: PROXY_HTTP / PROXY_HTTPS を環境変数に設定すればプロキシ利用
-    """
-    # CloudのSecrets（必要なら）→ st.secrets から
-    proxy_http = None
-    proxy_https = None
-    verify = True
-
-    if hasattr(st, "secrets"):
-        proxy_http = st.secrets.get("PROXY_HTTP", None)
-        proxy_https = st.secrets.get("PROXY_HTTPS", None)
-        verify = st.secrets.get("REQUESTS_VERIFY", True)
-
-    # 環境変数（ローカルPC向け）
-    if proxy_http is None:
-        proxy_http = os.environ.get("PROXY_HTTP")
-    if proxy_https is None:
-        proxy_https = os.environ.get("PROXY_HTTPS")
-
-    if "REQUESTS_VERIFY" in os.environ:
-        v = os.environ.get("REQUESTS_VERIFY", "true").lower()
-        verify = (v == "true")
-
-    proxies = None
-    if proxy_http or proxy_https:
-        proxies = {}
-        if proxy_http:
-            proxies["http"] = proxy_http
-        if proxy_https:
-            proxies["https"] = proxy_https
-
-    kwargs = {"timeout": 25, "verify": verify}
-    if proxies:
-        kwargs["proxies"] = proxies
-    return kwargs
-
 def adjust_to_next_business_day(available_dates: set[date], end_date: date) -> date:
     d = end_date
     for _ in range(7):
@@ -75,13 +33,12 @@ def adjust_to_next_business_day(available_dates: set[date], end_date: date) -> d
         d += timedelta(days=1)
     return end_date
 
-def load_quote_csv_minimal() -> pd.DataFrame:
-    kwargs = get_requests_kwargs()
-    r = requests.get(MIZUHO_CSV_URL, **kwargs)
+def load_quote_csv_cloud() -> pd.DataFrame:
+    # ★Cloudではプロキシを使わない（proxy2に行かない）
+    r = requests.get(MIZUHO_CSV_URL, timeout=25)
     r.raise_for_status()
     text = r.content.decode("shift_jis", errors="ignore")
 
-    # シンプル読込（fx_rate6系の方針）
     try:
         df = pd.read_csv(io.StringIO(text), encoding="shift_jis")
     except Exception:
@@ -111,7 +68,7 @@ def get_avg_ttm_simple(df: pd.DataFrame, ccy: str, start_d: date, end_d: date) -
         raise ValueError(f"{start_d}〜{end_d} に {ccy} のTTMが見つかりません。")
     return float(sel.mean())
 
-# ====== 印刷CSS（印刷は印刷ブロックのみ／白地黒文字／A4上半分） ======
+# ===== 印刷CSS（印刷は印刷ブロックのみ／白地黒文字／A4上半分）=====
 PRINT_CSS = r"""
 <style>
   .print-sheet { display: none; }
@@ -132,7 +89,7 @@ PRINT_CSS = r"""
 """
 st.markdown(PRINT_CSS, unsafe_allow_html=True)
 
-# ====== UI ======
+# ===== UI =====
 st.title("出張期間の平均レート")
 
 today = date.today()
@@ -154,7 +111,7 @@ if "do_print" not in st.session_state:
 
 if st.button("平均レート計算"):
     try:
-        df = load_quote_csv_minimal()
+        df = load_quote_csv_cloud()
         dates_set = set(df["DATE"].dt.date)
         adjusted_end = adjust_to_next_business_day(dates_set, end_date)
 
@@ -168,11 +125,7 @@ if st.button("平均レート計算"):
         avg_tts = round(avg_ttm + spread, 2)
 
         st.session_state["result"] = {
-            "start": start_date,
-            "end": adjusted_end,
-            "ccy": foreign,
-            "avg": avg_tts,
-            "note": adjust_note
+            "start": start_date, "end": adjusted_end, "ccy": foreign, "avg": avg_tts, "note": adjust_note
         }
     except Exception as e:
         st.error(str(e))
@@ -186,8 +139,7 @@ if res:
 
     st.markdown(
         (
-            '<div class="print-sheet">'
-            '<div>'
+            '<div class="print-sheet"><div>'
             '<h2 style="margin:0 0 8mm 0;">出張期間の平均レート</h2>'
             f"<div>開始日：{res['start']:%Y/%m/%d}</div>"
             f"<div>終了日：{res['end']:%Y/%m/%d}</div>"
