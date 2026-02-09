@@ -1,18 +1,28 @@
+# fx_rate8_app.py（Streamlit Cloud 安定版：ヘッダ自動検出＋プロキシ完全無視）
+# - みずほ quote.csv（TTM）→ 期間平均TTM → スプレッド加算で平均TTS
+# - THBスプレッドは「100THBあたり8円」→ 1THBあたり0.08円（/100補正）
+# - 帰着日に公表が無い場合は翌営業日に補正（最大+7日）、メッセージは画面＆印刷に反映
+# - 印刷は「印刷用レイアウトのみ」A4縦上半分、白地黒文字
+# - Streamlit Cloud 上で社内プロキシ(proxy2...)を絶対に使わない（trust_env=False＋proxies無効）
+# - みずほCSVのヘッダー行を自動検出（Unnamed問題を解消）
+# - 三重引用 f-string を使わず format で印刷HTMLを生成（貼り付け事故対策）
+
 import io
+import os
 from datetime import date, timedelta
 import requests
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
-# ====== みずほ quote.csv（公開データ） ======
+APP_VERSION = "fx_rate8_cloud_fix_headers_no_proxy_2026-02-02"
+
 MIZUHO_CSV_URL = "https://www.mizuhobank.co.jp/market/quote.csv"
 
-# ====== 通貨（IDRは除外） ======
+# 通貨（IDR除外）
 TARGET_CCYS = ["USD", "EUR", "GBP", "AUD", "SGD", "THB"]
 
-# ====== スプレッド（円） ======
-# THB: 100THBあたり8円 → 1THBあたり0.08円として加算
+# スプレッド（円） THBは100THBあたり8円 → /100
 SPREAD_BY_CCY_JPY = {
     "USD": 1.00,
     "EUR": 1.40,
@@ -27,13 +37,13 @@ def get_spread_per_unit(ccy: str) -> float:
     s = float(SPREAD_BY_CCY_JPY.get(ccy.upper(), 0.0))
     return s / 100.0 if ccy.upper() in HUNDRED_UNIT_SPREAD else s
 
-# ====== session_state（結果保持・印刷トリガ） ======
+# session_state
 if "result" not in st.session_state:
     st.session_state["result"] = None  # {"start","end","ccy","avg","note"}
 if "do_print" not in st.session_state:
     st.session_state["do_print"] = False
 
-# ====== 印刷CSS（印刷は印刷ブロックのみ / 白地黒文字 / A4上半分） ======
+# 印刷CSS（印刷は印刷ブロックのみ／白地黒文字／A4上半分）
 PRINT_CSS = r"""
 <style>
   .print-sheet { display: none; }
@@ -41,14 +51,14 @@ PRINT_CSS = r"""
   @media print {
     @page { size: A4; margin: 16mm; }
 
-    /* まず全部隠す：注意文・入力欄・ボタン等は印刷しない */
+    /* 全部隠す：注意文・入力欄・ボタン等は印刷しない */
     body * { visibility: hidden !important; }
 
     /* 印刷ブロックだけ可視化 */
     .print-sheet, .print-sheet * { visibility: visible !important; }
 
     /* 白地＋黒文字を強制（反転防止） */
-    html, body, .stApp, .stApp * { background: #fff !important; color: #000 !important; }
+    html, body, .stApp, .stApp * { background:#fff !important; color:#000 !important; }
     * {
       -webkit-text-fill-color:#000 !important;
       text-shadow:none !important;
@@ -68,7 +78,7 @@ PRINT_CSS = r"""
       page-break-inside:avoid;
     }
 
-    /* 体裁（ほどよいまとまり） */
+    /* 体裁 */
     .sheet-box{ width:165mm; max-width:100%; margin:0 auto; padding-top:6mm; box-sizing:border-box; }
     .sheet-title{ font-size:22pt; font-weight:700; margin:0 0 10mm 0; }
     .sheet-grid{ display:grid; grid-template-columns:1fr 1fr; column-gap:12mm; row-gap:4mm; font-size:11pt; }
@@ -86,34 +96,95 @@ PRINT_CSS = r"""
 """
 st.markdown(PRINT_CSS, unsafe_allow_html=True)
 
-# ====== 重要：Cloudではプロキシを絶対に使わない ======
-def load_quote_csv_cloud_no_proxy() -> pd.DataFrame:
+# ========= Cloudでproxyを完全に無視するための処理 =========
+def _purge_proxy_env():
+    # requestsが勝手に拾う可能性のある環境変数プロキシを削除
+    for k in [
+        "HTTP_PROXY","HTTPS_PROXY","http_proxy","https_proxy",
+        "ALL_PROXY","all_proxy","NO_PROXY","no_proxy"
+    ]:
+        os.environ.pop(k, None)
+
+def download_quote_csv_text() -> str:
     """
-    Streamlit Cloud上で社内プロキシ(proxy2...)を参照して落ちる問題を根本回避するため、
-    requestsが環境変数(HTTP_PROXY/HTTPS_PROXY)を自動参照しないように trust_env=False を設定する。
+    Cloud環境で社内プロキシを参照して落ちる問題を根本回避：
+      - 環境変数のプロキシを削除
+      - Session.trust_env=False で環境参照を無効
+      - proxies={"http":None,"https":None} を明示
     """
+    _purge_proxy_env()
     s = requests.Session()
-    s.trust_env = False  # ★ここが肝：proxy2等の環境変数プロキシを無視する
+    s.trust_env = False
 
-    r = s.get(MIZUHO_CSV_URL, timeout=25)
+    r = s.get(
+        MIZUHO_CSV_URL,
+        timeout=25,
+        proxies={"http": None, "https": None},
+    )
     r.raise_for_status()
-    text = r.content.decode("shift_jis", errors="ignore")
+    return r.content.decode("shift_jis", errors="ignore")
 
+def _looks_like_date(s: str) -> bool:
+    # 2002/4/1 などを想定（曖昧でも to_datetime に任せる）
     try:
-        df = pd.read_csv(io.StringIO(text), encoding="shift_jis")
+        pd.to_datetime(s, errors="raise")
+        return True
     except Exception:
-        df = pd.read_csv(io.StringIO(text), encoding="shift_jis", header=None)
+        return False
 
-    # 先頭列をDATEに
-    cols = [str(c).strip() for c in df.columns]
-    if not cols or cols[0].upper() != "DATE":
+def parse_quote_csv(text: str) -> pd.DataFrame:
+    """
+    みずほ quote.csv の「ヘッダ行が複数ある」問題に対応して、
+    USD/EUR... を含む行をヘッダとして自動選択する。
+    """
+    # いったん header=None で生読み
+    raw = pd.read_csv(io.StringIO(text), encoding="shift_jis", header=None)
+
+    # ヘッダ候補行を探す
+    # 条件：その行に TARGET_CCYS のうち複数（例：USD, EUR）が含まれる
+    # かつ 次行の先頭が日付っぽい
+    header_idx = None
+    scan_rows = min(len(raw), 30)
+    for i in range(scan_rows):
+        row = [str(x).strip() for x in raw.iloc[i].tolist()]
+        tokens = set(row)
+        score = sum(1 for t in TARGET_CCYS if t in tokens)
+
+        next_is_date = False
+        if i + 1 < scan_rows:
+            next_first = str(raw.iloc[i + 1, 0]).strip()
+            next_is_date = _looks_like_date(next_first)
+
+        # USD/EUR などが複数あり、次行が日付ならヘッダとみなす
+        if score >= 2 and next_is_date:
+            header_idx = i
+            break
+
+    # ヘッダが見つからなければ、従来どおり header=0 を試す
+    if header_idx is None:
+        df = pd.read_csv(io.StringIO(text), encoding="shift_jis")
+        cols = [str(c).strip() for c in df.columns]
+        if not cols or cols[0].upper() != "DATE":
+            cols[0] = "DATE"
+        df.columns = cols
+    else:
+        df = pd.read_csv(io.StringIO(text), encoding="shift_jis", header=header_idx)
+        cols = [str(c).strip() for c in df.columns]
         cols[0] = "DATE"
-    df.columns = cols
+        df.columns = cols
 
+    # DATE整形
     df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
     df = df.dropna(subset=["DATE"]).reset_index(drop=True)
+
     return df
 
+def load_quote_df() -> pd.DataFrame:
+    text = download_quote_csv_text()
+    df = parse_quote_csv(text)
+    return df
+
+# ===== 計算関数 =====
 def adjust_to_next_business_day(available_dates: set[date], end_date: date) -> date:
     d = end_date
     for _ in range(7):
@@ -123,6 +194,7 @@ def adjust_to_next_business_day(available_dates: set[date], end_date: date) -> d
     return end_date
 
 def get_avg_ttm_simple(df: pd.DataFrame, ccy: str, start_d: date, end_d: date) -> float:
+    # 列が無い場合は、列名一覧を返す
     if ccy not in df.columns:
         available = ", ".join([c for c in df.columns if c != "DATE"])
         raise KeyError(f"{ccy} 列が見つかりません。CSV上の列名: {available}")
@@ -138,7 +210,6 @@ def get_avg_ttm_simple(df: pd.DataFrame, ccy: str, start_d: date, end_d: date) -
     return float(sel.mean())
 
 def build_print_html(start_d: date, end_d: date, ccy: str, avg: float, note: str) -> str:
-    # 三重引用f-stringを使わず formatで生成
     lines = [
         '<div class="print-sheet">',
         '  <div class="sheet-box">',
@@ -163,8 +234,11 @@ def build_print_html(start_d: date, end_d: date, ccy: str, avg: float, note: str
         note=note
     )
 
-# ====== UI ======
+# ===== UI =====
 st.title("出張期間の平均レート")
+
+with st.expander("（確認用）稼働情報", expanded=False):
+    st.write("APP_VERSION:", APP_VERSION)
 
 today = date.today()
 default_start = today - timedelta(days=30)
@@ -175,14 +249,15 @@ with c1:
 with c2:
     end_date = st.date_input("終了日（帰着日）", today)
 
-# 画面だけの注意文（印刷には出ません：印刷はprint-sheetのみ）
+# 画面だけの注意文（印刷には出ない）
 st.caption("プルダウンに出ない通貨の場合には、メールで経理U及川宛てにレートの問い合わせをしてください")
 
 foreign = st.selectbox("外貨（対JPY）", TARGET_CCYS, index=0)
 
 if st.button("平均レート計算"):
     try:
-        df = load_quote_csv_cloud_no_proxy()
+        df = load_quote_df()
+
         dates_set = set(df["DATE"].dt.date)
         adjusted_end = adjust_to_next_business_day(dates_set, end_date)
 
@@ -202,8 +277,11 @@ if st.button("平均レート計算"):
             "avg": avg_tts,
             "note": adjust_note
         }
+
     except Exception as e:
         st.error(str(e))
+        # 初心者向け：原因究明のため例外詳細も見せる
+        st.exception(e)
 
 res = st.session_state.get("result")
 if res:
