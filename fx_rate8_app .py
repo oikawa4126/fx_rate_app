@@ -1,12 +1,12 @@
-# fx_rate8_app.py（KRW対応版：全文置換）
+# fx_rate8_app.py（KRW除外版：全文置換）
 # - みずほ quote.csv（TTM）→ 期間平均TTM → スプレッド加算で平均TTS
-# - THB: スプレッド 100THBあたり8円 → /100補正
-# - KRW: レートが KRW(100)（100通貨単位）→ /100補正、スプレッドも 100通貨あたり0.2円 → /100補正
+# - THBスプレッドは「100THBあたり8円」→ /100補正
 # - 帰着日に公表が無い場合は翌営業日に補正（最大+7日）、メッセージは画面＆印刷に反映
 # - 印刷は「印刷用レイアウトのみ」A4縦上半分、白地黒文字
-# - Streamlit Cloud 上で社内プロキシ(proxy2...)を絶対に使わない（trust_env=False＋proxies無効）
+# - Streamlit Cloud 上で社内プロキシ(proxy2...)を絶対に使わない（trust_env=False＋proxies無効＋環境変数プロキシ削除）
 # - みずほCSVのヘッダー行を自動検出（Unnamed問題を解消）
 # - 三重引用 f-string を使わず format で印刷HTMLを生成（貼り付け事故対策）
+# - ★KRWは計算対象から除外（プルダウン・列解決・スプレッドから削除）
 
 import io
 import os
@@ -16,16 +16,15 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
-APP_VERSION = "fx_rate8_cloud_fix_headers_no_proxy_KRW_2026-02-16"
+APP_VERSION = "fx_rate8_cloud_fix_headers_no_proxy_NO_KRW_2026-02-16"
 
 MIZUHO_CSV_URL = "https://www.mizuhobank.co.jp/market/quote.csv"
 
-# ▼ 通貨（KRW追加）
-TARGET_CCYS = ["USD", "EUR", "GBP", "AUD", "SGD", "THB", "KRW"]
+# ▼ 通貨（KRWなし）
+TARGET_CCYS = ["USD", "EUR", "GBP", "AUD", "SGD", "THB"]
 
 # ▼ スプレッド（円）
-# THB: 100THBあたり8円
-# KRW: 100KRWあたり0.2円（指定どおり）
+# THB: 100THBあたり8円 → /100補正
 SPREAD_BY_CCY_JPY = {
     "USD": 1.00,
     "EUR": 1.40,
@@ -33,11 +32,8 @@ SPREAD_BY_CCY_JPY = {
     "AUD": 2.50,
     "SGD": 0.83,
     "THB": 8.00,   # 100THBあたり
-    "KRW": 0.20,   # 100KRWあたり ★追加
 }
-
-# 「100通貨あたりスプレッド」扱い
-HUNDRED_UNIT_SPREAD = {"THB", "KRW"}
+HUNDRED_UNIT_SPREAD = {"THB"}
 
 def get_spread_per_unit(ccy: str) -> float:
     s = float(SPREAD_BY_CCY_JPY.get(ccy.upper(), 0.0))
@@ -132,7 +128,7 @@ def parse_quote_csv(text: str) -> pd.DataFrame:
         row = [str(x).strip() for x in raw.iloc[i].tolist()]
         tokens = set(row)
 
-        # USD/EUR等が複数含まれる行をヘッダ候補にする（KRWがあってもなくてもOK）
+        # USD/EUR/GBP が複数含まれる行をヘッダ候補にする
         score = sum(1 for t in ["USD", "EUR", "GBP"] if t in tokens)
 
         next_is_date = False
@@ -164,16 +160,10 @@ def load_quote_df() -> pd.DataFrame:
     text = download_quote_csv_text()
     return parse_quote_csv(text)
 
-# ===== 列名解決（KRWは KRW(100) を見る） =====
-HUNDRED_UNIT_RATE_CCYS = {"KRW"}  # 100通貨単位の“レート列”を持つ通貨
-
+# ===== 列名解決（KRWなし。THBは通常列で入る前提） =====
 def resolve_rate_column(df: pd.DataFrame, ccy: str) -> str:
     c = ccy.upper()
-    if c in HUNDRED_UNIT_RATE_CCYS:
-        candidates = [f"{c}(100)", f"{c}(100).1", c, f"{c}.1"]
-    else:
-        candidates = [c, f"{c}.1"]
-
+    candidates = [c, f"{c}.1"]  # 重複列への保険
     for name in candidates:
         if name in df.columns:
             return name
@@ -195,21 +185,14 @@ def get_avg_ttm_simple(df: pd.DataFrame, ccy: str, start_d: date, end_d: date) -
 
     tmp = df[["DATE", col]].copy()
     tmp["DATE_ONLY"] = tmp["DATE"].dt.date
-    tmp["TTM_RAW"] = pd.to_numeric(tmp[col], errors="coerce")
+    tmp["TTM"] = pd.to_numeric(tmp[col], errors="coerce")
 
     mask = (tmp["DATE_ONLY"] >= start_d) & (tmp["DATE_ONLY"] <= end_d)
-    sel = tmp.loc[mask, "TTM_RAW"].dropna()
-
+    sel = tmp.loc[mask, "TTM"].dropna()
     if sel.empty:
-        raise ValueError(f"{start_d}〜{end_d} に {ccy} のTTMが見つかりません。")
+        raise ValueError(f"{start_d:%Y-%m-%d}〜{end_d:%Y-%m-%d} に {ccy} のTTMが見つかりません。")
 
-    avg = float(sel.mean())
-
-    # KRW(100) は 100通貨あたりなので 1通貨あたりへ /100
-    if ccy.upper() in HUNDRED_UNIT_RATE_CCYS and "(100)" in col:
-        avg = avg / 100.0
-
-    return avg
+    return float(sel.mean())
 
 def build_print_html(start_d: date, end_d: date, ccy: str, avg: float, note: str) -> str:
     lines = [
@@ -232,7 +215,7 @@ def build_print_html(start_d: date, end_d: date, ccy: str, avg: float, note: str
         start=start_d.strftime("%Y/%m/%d"),
         end=end_d.strftime("%Y/%m/%d"),
         ccy=ccy,
-        avg=f"{avg:,.4f}" if ccy.upper() == "KRW" else f"{avg:,.2f}",
+        avg=f"{avg:,.2f}",
         note=note
     )
 
@@ -257,8 +240,10 @@ st.caption("プルダウンに出ない通貨の場合には、メールで経�
 foreign = st.selectbox("外貨（対JPY）", TARGET_CCYS, index=0)
 
 if st.button("平均レート計算"):
+    st.session_state["result"] = None
     try:
         df = load_quote_df()
+
         dates_set = set(df["DATE"].dt.date)
         adjusted_end = adjust_to_next_business_day(dates_set, end_date)
 
@@ -269,7 +254,7 @@ if st.button("平均レート計算"):
 
         avg_ttm = get_avg_ttm_simple(df, foreign, start_date, adjusted_end)
         spread = get_spread_per_unit(foreign)
-        avg_tts = round(avg_ttm + spread, 6 if foreign.upper() == "KRW" else 2)
+        avg_tts = round(avg_ttm + spread, 2)
 
         st.session_state["result"] = {
             "start": start_date,
@@ -281,15 +266,10 @@ if st.button("平均レート計算"):
 
     except Exception as e:
         st.error(str(e))
-        st.exception(e)
 
 res = st.session_state.get("result")
 if res:
-    # KRWは桁が小さいので表示桁を増やす
-    if res["ccy"].upper() == "KRW":
-        st.metric("平均TTS（円）", f"{res['avg']:,.4f}")
-    else:
-        st.metric("平均TTS（円）", f"{res['avg']:,.2f}")
+    st.metric("平均TTS（円）", f"{res['avg']:,.2f}")
 
     if st.button("平均レート印刷"):
         st.session_state["do_print"] = True
