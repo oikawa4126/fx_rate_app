@@ -1,13 +1,4 @@
-# fx_rate8_app.py（KRW除外版：全文置換）
-# - みずほ quote.csv（TTM）→ 期間平均TTM → スプレッド加算で平均TTS
-# - THBスプレッドは「100THBあたり8円」→ /100補正
-# - 帰着日に公表が無い場合は翌営業日に補正（最大+7日）、メッセージは画面＆印刷に反映
-# - 印刷は「印刷用レイアウトのみ」A4縦上半分、白地黒文字
-# - Streamlit Cloud 上で社内プロキシ(proxy2...)を絶対に使わない（trust_env=False＋proxies無効＋環境変数プロキシ削除）
-# - みずほCSVのヘッダー行を自動検出（Unnamed問題を解消）
-# - 三重引用 f-string を使わず format で印刷HTMLを生成（貼り付け事故対策）
-# - ★KRWは計算対象から除外（プルダウン・列解決・スプレッドから削除）
-
+# fx_rate8_app.py（全文置換：403対策＋Cloud安定版＋KRW除外）
 import io
 import os
 from datetime import date, timedelta
@@ -16,15 +7,18 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
-APP_VERSION = "fx_rate8_cloud_fix_headers_no_proxy_NO_KRW_2026-02-16"
+APP_VERSION = "fx_rate8_cloud_403fix_no_proxy_NO_KRW_2026-03-02"
 
-MIZUHO_CSV_URL = "https://www.mizuhobank.co.jp/market/quote.csv"
+# みずほCSV（403回避のため、ホスト違いも試す）
+MIZUHO_CSV_URL_CANDIDATES = [
+    "https://mizuhobank.co.jp/market/quote.csv",
+    "https://www.mizuhobank.co.jp/market/quote.csv",
+]
 
-# ▼ 通貨（KRWなし）
+# 対象通貨（KRWなし）
 TARGET_CCYS = ["USD", "EUR", "GBP", "AUD", "SGD", "THB"]
 
-# ▼ スプレッド（円）
-# THB: 100THBあたり8円 → /100補正
+# スプレッド（円） THBは100THBあたり8円 → /100補正
 SPREAD_BY_CCY_JPY = {
     "USD": 1.00,
     "EUR": 1.40,
@@ -49,10 +43,8 @@ if "do_print" not in st.session_state:
 PRINT_CSS = r"""
 <style>
   .print-sheet { display: none; }
-
   @media print {
     @page { size: A4; margin: 16mm; }
-
     body * { visibility: hidden !important; }
     .print-sheet, .print-sheet * { visibility: visible !important; }
 
@@ -92,7 +84,7 @@ PRINT_CSS = r"""
 """
 st.markdown(PRINT_CSS, unsafe_allow_html=True)
 
-# ========= Cloudでproxyを完全に無視するための処理 =========
+# ===== Cloudでproxyを完全に無視するための処理 =====
 def _purge_proxy_env():
     for k in [
         "HTTP_PROXY","HTTPS_PROXY","http_proxy","https_proxy",
@@ -101,16 +93,45 @@ def _purge_proxy_env():
         os.environ.pop(k, None)
 
 def download_quote_csv_text() -> str:
+    """
+    403対策：
+      - User-Agent等のヘッダーを付与（ブラウザっぽく）
+      - URLを2候補試す（no-www → www）
+    Cloud安定：
+      - 環境変数proxy削除
+      - Session.trust_env=False
+      - proxiesを明示的に無効
+    """
     _purge_proxy_env()
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept": "text/csv,text/plain,*/*",
+        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+
     s = requests.Session()
-    s.trust_env = False
-    r = s.get(
-        MIZUHO_CSV_URL,
-        timeout=25,
-        proxies={"http": None, "https": None},
-    )
-    r.raise_for_status()
-    return r.content.decode("shift_jis", errors="ignore")
+    s.trust_env = False  # 環境proxy無視
+
+    last_err = None
+    for url in MIZUHO_CSV_URL_CANDIDATES:
+        try:
+            r = s.get(
+                url,
+                timeout=25,
+                headers=headers,
+                allow_redirects=True,
+                proxies={"http": None, "https": None},  # proxy無効
+            )
+            r.raise_for_status()
+            return r.content.decode("shift_jis", errors="ignore")
+        except Exception as e:
+            last_err = e
+
+    # どちらも失敗
+    raise last_err
 
 def _looks_like_date(s: str) -> bool:
     try:
@@ -120,6 +141,10 @@ def _looks_like_date(s: str) -> bool:
         return False
 
 def parse_quote_csv(text: str) -> pd.DataFrame:
+    """
+    みずほquote.csvはヘッダ行が複数あり得るため、
+    USD/EUR/GBP などを含む行をヘッダとして自動検出する（Unnamed回避）。
+    """
     raw = pd.read_csv(io.StringIO(text), encoding="shift_jis", header=None)
 
     header_idx = None
@@ -127,8 +152,6 @@ def parse_quote_csv(text: str) -> pd.DataFrame:
     for i in range(scan_rows):
         row = [str(x).strip() for x in raw.iloc[i].tolist()]
         tokens = set(row)
-
-        # USD/EUR/GBP が複数含まれる行をヘッダ候補にする
         score = sum(1 for t in ["USD", "EUR", "GBP"] if t in tokens)
 
         next_is_date = False
@@ -157,21 +180,16 @@ def parse_quote_csv(text: str) -> pd.DataFrame:
     return df
 
 def load_quote_df() -> pd.DataFrame:
-    text = download_quote_csv_text()
-    return parse_quote_csv(text)
+    return parse_quote_csv(download_quote_csv_text())
 
-# ===== 列名解決（KRWなし。THBは通常列で入る前提） =====
 def resolve_rate_column(df: pd.DataFrame, ccy: str) -> str:
     c = ccy.upper()
-    candidates = [c, f"{c}.1"]  # 重複列への保険
-    for name in candidates:
+    for name in (c, f"{c}.1"):
         if name in df.columns:
             return name
-
     available = ", ".join([col for col in df.columns if col != "DATE"])
     raise KeyError(f"{ccy} 列が見つかりません。CSV上の列名: {available}")
 
-# ===== 計算関数 =====
 def adjust_to_next_business_day(available_dates: set[date], end_date: date) -> date:
     d = end_date
     for _ in range(7):
@@ -182,7 +200,6 @@ def adjust_to_next_business_day(available_dates: set[date], end_date: date) -> d
 
 def get_avg_ttm_simple(df: pd.DataFrame, ccy: str, start_d: date, end_d: date) -> float:
     col = resolve_rate_column(df, ccy)
-
     tmp = df[["DATE", col]].copy()
     tmp["DATE_ONLY"] = tmp["DATE"].dt.date
     tmp["TTM"] = pd.to_numeric(tmp[col], errors="coerce")
@@ -191,7 +208,6 @@ def get_avg_ttm_simple(df: pd.DataFrame, ccy: str, start_d: date, end_d: date) -
     sel = tmp.loc[mask, "TTM"].dropna()
     if sel.empty:
         raise ValueError(f"{start_d:%Y-%m-%d}〜{end_d:%Y-%m-%d} に {ccy} のTTMが見つかりません。")
-
     return float(sel.mean())
 
 def build_print_html(start_d: date, end_d: date, ccy: str, avg: float, note: str) -> str:
@@ -243,7 +259,6 @@ if st.button("平均レート計算"):
     st.session_state["result"] = None
     try:
         df = load_quote_df()
-
         dates_set = set(df["DATE"].dt.date)
         adjusted_end = adjust_to_next_business_day(dates_set, end_date)
 
