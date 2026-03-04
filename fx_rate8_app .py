@@ -1,5 +1,4 @@
 import io
-import os
 from datetime import date, timedelta
 
 import pandas as pd
@@ -126,6 +125,7 @@ def get_avg_ttm_simple(df: pd.DataFrame, ccy: str, start_d: date, end_d: date) -
     return float(sel.mean())
 
 def build_print_html(start_d: date, end_d: date, ccy: str, avg: float, note: str) -> str:
+    # ✅ 誤字修正：清算書 → 精算書
     fixed_sentence = "レートの証明として精算書にこの書面を添付してください。"
     return "\n".join([
         '<div class="print-sheet"><div>',
